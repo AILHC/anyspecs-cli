@@ -113,10 +113,12 @@ Note: After first-time setup, API keys and models are auto-saved to .env file an
         
         # list command
         list_parser = subparsers.add_parser('list', help='List all chat sessions')
-        list_parser.add_argument('--source', '-s', 
-                               choices=['cursor', 'claude', 'kiro', 'augment', 'codex', 'all'], 
+        list_parser.add_argument('--source', '-s',
+                               choices=['cursor', 'claude', 'kiro', 'augment', 'codex', 'all'],
                                default='all',
                                help='Source to list sessions from (default: all)')
+        list_parser.add_argument('--all-projects', '-a', action='store_true',
+                               help='List all projects\' sessions (for Claude, scans all project directories)')
         list_parser.add_argument('--verbose', '-v', action='store_true', help='Display detailed information')
         
         # export command
@@ -206,14 +208,20 @@ Note: After first-time setup, API keys and models are auto-saved to .env file an
     def _list_command(self, args) -> int:
         """Execute the list command."""
         print("🔍 Searching for chat records...")
-        
+
         # Collect sessions from all requested sources
         all_sessions = []
         sources_to_check = ['cursor', 'claude', 'kiro', 'augment', 'codex'] if args.source == 'all' else [args.source]
-        
+
         for source in sources_to_check:
             extractor = self.extractors[source]
             try:
+                # For Claude, support --all-projects option
+                if source == 'claude' and hasattr(args, 'all_projects') and args.all_projects:
+                    from .exporters.claude import ClaudeExtractor
+                    if isinstance(extractor, ClaudeExtractor):
+                        extractor.set_scan_all_projects(True)
+
                 sessions = extractor.list_sessions()
                 for session in sessions:
                     session['source'] = source

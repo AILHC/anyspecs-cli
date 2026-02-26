@@ -3,6 +3,7 @@ Claude Code chat history extractor.
 """
 
 import json
+import os
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List
@@ -13,12 +14,43 @@ from ..utils.paths import get_claude_history_path, get_project_name
 
 class ClaudeExtractor(BaseExtractor):
     """Extractor for Claude Code chat history."""
-    
+
     def __init__(self):
         super().__init__('claude')
-    
-    def extract_chats(self) -> List[Dict[str, Any]]:
-        """Extract all chat data from Claude Code."""
+        self._scan_all_projects = False
+
+    def _format_content(self, content) -> str:
+        """Format content for display, handling both string and list formats."""
+        if isinstance(content, list):
+            # Extract text from content blocks
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if 'text' in item:
+                        text_parts.append(item['text'])
+                    elif 'content' in item and isinstance(item['content'], str):
+                        text_parts.append(item['content'])
+                elif isinstance(item, str):
+                    text_parts.append(item)
+            return '\n'.join(text_parts) if text_parts else str(content)
+        elif isinstance(content, str):
+            return content
+        else:
+            return str(content)
+
+    def set_scan_all_projects(self, scan_all: bool = True):
+        """Set whether to scan all Claude project directories."""
+        self._scan_all_projects = scan_all
+
+    def extract_chats(self, scan_all: bool = False) -> List[Dict[str, Any]]:
+        """Extract all chat data from Claude Code.
+
+        Args:
+            scan_all: If True, scan all Claude project directories instead of just current project.
+        """
+        if scan_all or self._scan_all_projects:
+            return self._extract_all_chats()
+
         history_path = get_claude_history_path()
         
         if not history_path.exists():
@@ -69,15 +101,17 @@ class ClaudeExtractor(BaseExtractor):
                 entry_type = entry.get('type')
                 
                 if entry_type == 'user':
-                    content = entry.get('message', {}).get('content', 'No content')
+                    raw_content = entry.get('message', {}).get('content', 'No content')
+                    content = self._format_content(raw_content)
                     sessions[session_id]['messages'].append({
                         'role': 'user',
                         'content': content,
                         'timestamp': timestamp
                     })
-                
+
                 elif entry_type == 'assistant':
-                    content = entry.get('message', {}).get('content', 'No content')
+                    raw_content = entry.get('message', {}).get('content', 'No content')
+                    content = self._format_content(raw_content)
                     sessions[session_id]['messages'].append({
                         'role': 'assistant',
                         'content': content,
@@ -179,8 +213,25 @@ class ClaudeExtractor(BaseExtractor):
             preview = "No messages"
             messages = chat.get('messages', [])
             if messages:
-                first_msg = messages[0].get('content', '')
-                preview = first_msg[:60] + "..." if len(first_msg) > 60 else first_msg
+                first_msg_content = messages[0].get('content', '')
+
+                # Handle both string and list content formats
+                if isinstance(first_msg_content, list):
+                    # Extract text from content blocks
+                    text_parts = []
+                    for item in first_msg_content:
+                        if isinstance(item, dict):
+                            if 'text' in item:
+                                text_parts.append(item['text'])
+                            elif 'content' in item and isinstance(item['content'], str):
+                                text_parts.append(item['content'])
+                    preview_text = ' '.join(text_parts)
+                elif isinstance(first_msg_content, str):
+                    preview_text = first_msg_content
+                else:
+                    preview_text = str(first_msg_content)
+
+                preview = preview_text[:60] + "..." if len(preview_text) > 60 else preview_text
                 preview = preview.replace('\n', ' ')
             
             sessions.append({
@@ -230,4 +281,184 @@ class ClaudeExtractor(BaseExtractor):
         except Exception as e:
             self.logger.error(f"Error reading file {file_path}: {e}")
         
-        return entries 
+        return entries
+
+    def _get_all_claude_projects(self) -> List[Path]:
+        """Get all Claude project directories."""
+        history_base = Path.home() / '.claude' / 'projects'
+        if not history_base.exists():
+            return []
+
+        projects = []
+        for item in history_base.iterdir():
+            if item.is_dir():
+                projects.append(item)
+        return sorted(projects, key=lambda p: p.stat().st_mtime, reverse=True)
+
+    def _decode_project_path(self, encoded_dir: str) -> str:
+        """Decode an encoded project directory name back to a readable path.
+
+        Examples:
+            E--own-space-ai-workflow-lab -> E:\\own-space\\ai-workflow-lab
+            C--Users-username-projects -> C:\\Users\\username\\projects
+        """
+        # Replace encoded dashes back to path separators
+        # The encoding replaces: / -> -, \ -> -, : -> -
+        # We need to reverse this intelligently
+        parts = encoded_dir.replace('--', ':\\').replace('-', '\\')
+        # Fix double backslashes
+        return parts.replace('\\\\', '\\')
+
+    def _extract_project_name_from_dir(self, dir_name: str) -> str:
+        """Extract a readable project name from encoded directory name."""
+        try:
+            decoded = self._decode_project_path(dir_name)
+            # Get the last component as project name
+            return Path(decoded).name
+        except:
+            return dir_name
+
+    def _extract_all_chats(self) -> List[Dict[str, Any]]:
+        """Extract chat data from all Claude project directories."""
+        history_base = Path.home() / '.claude' / 'projects'
+        if not history_base.exists():
+            self.logger.debug(f"Claude projects directory not found: {history_base}")
+            return []
+
+        project_dirs = self._get_all_claude_projects()
+        if not project_dirs:
+            self.logger.debug("No Claude project directories found")
+            return []
+
+        self.logger.debug(f"Found {len(project_dirs)} Claude project directories")
+
+        all_chats = []
+        for project_dir in project_dirs:
+            project_name = self._extract_project_name_from_dir(project_dir.name)
+
+            history_files = self._list_history_files(project_dir)
+            if not history_files:
+                continue
+
+            # Group entries by session
+            sessions = {}
+
+            for file_info in history_files:
+                entries = self._read_history_file(file_info['path'])
+                for entry in entries:
+                    session_id = entry.get('sessionId', 'unknown')
+
+                    if session_id not in sessions:
+                        sessions[session_id] = {
+                            'session_id': session_id,
+                            'messages': [],
+                            'project': {
+                                'name': project_name,
+                                'rootPath': str(project_dir)
+                            },
+                            'metadata': {
+                                'source_files': [],
+                                'created_at': None,
+                                'last_updated': None
+                            }
+                        }
+
+                    # Track source files
+                    source_file = str(file_info['path'])
+                    if source_file not in sessions[session_id]['metadata']['source_files']:
+                        sessions[session_id]['metadata']['source_files'].append(source_file)
+
+                    # Update timestamps
+                    timestamp = entry.get('timestamp')
+                    if timestamp:
+                        if sessions[session_id]['metadata']['created_at'] is None:
+                            sessions[session_id]['metadata']['created_at'] = timestamp
+                        sessions[session_id]['metadata']['last_updated'] = timestamp
+
+                    # Convert entries to messages
+                    entry_type = entry.get('type')
+
+                    if entry_type == 'user':
+                        raw_content = entry.get('message', {}).get('content', 'No content')
+                        content = self._format_content(raw_content)
+                        sessions[session_id]['messages'].append({
+                            'role': 'user',
+                            'content': content,
+                            'timestamp': timestamp
+                        })
+
+                    elif entry_type == 'assistant':
+                        raw_content = entry.get('message', {}).get('content', 'No content')
+                        content = self._format_content(raw_content)
+                        sessions[session_id]['messages'].append({
+                            'role': 'assistant',
+                            'content': content,
+                            'timestamp': timestamp
+                        })
+
+                    elif entry_type == 'tool':
+                        tool_name = entry.get('tool', 'Unknown')
+                        input_data = entry.get('input', {})
+                        content = f"**Tool Call: {tool_name}**\n\n"
+                        if input_data:
+                            content += f"```json\n{json.dumps(input_data, indent=2, default=str)}\n```"
+
+                        sessions[session_id]['messages'].append({
+                            'role': 'assistant',
+                            'content': content,
+                            'timestamp': timestamp
+                        })
+
+                    elif entry_type == 'tool_result':
+                        result = entry.get('result', {})
+                        content = "**Tool Result**\n\n"
+
+                        if isinstance(result, dict):
+                            if 'output' in result:
+                                content += f"```\n{result['output']}\n```"
+                            else:
+                                content += f"```json\n{json.dumps(result, indent=2, default=str)}\n```"
+                        else:
+                            content += f"```\n{result}\n```"
+
+                        sessions[session_id]['messages'].append({
+                            'role': 'assistant',
+                            'content': content,
+                            'timestamp': timestamp
+                        })
+
+            # Convert to output format
+            for session_data in sessions.values():
+                # Calculate date from timestamps
+                date_timestamp = None
+                if session_data['metadata']['created_at']:
+                    try:
+                        date_timestamp = datetime.fromisoformat(session_data['metadata']['created_at'].replace('Z', '+00:00'))
+                        date_timestamp = date_timestamp.timestamp()
+                    except:
+                        try:
+                            date_timestamp = float(session_data['metadata']['created_at'])
+                        except:
+                            date_timestamp = datetime.now().timestamp()
+                else:
+                    date_timestamp = datetime.now().timestamp()
+
+                chat_data = {
+                    'project': session_data['project'],
+                    'session': {
+                        'sessionId': session_data['session_id'],
+                        'title': f"Claude Session {session_data['session_id'][:8]}",
+                        'createdAt': date_timestamp * 1000 if date_timestamp else None,
+                        'lastUpdatedAt': date_timestamp * 1000 if date_timestamp else None
+                    },
+                    'messages': session_data['messages'],
+                    'metadata': session_data['metadata']
+                }
+
+                all_chats.append(chat_data)
+
+        # Sort by creation time
+        all_chats.sort(key=lambda x: x['session'].get('createdAt', 0), reverse=True)
+
+        self.logger.debug(f"Extracted {len(all_chats)} Claude chat sessions from all projects")
+        return all_chats 
