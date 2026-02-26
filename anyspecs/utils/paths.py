@@ -54,7 +54,7 @@ def get_claude_history_path(project_path: Optional[str] = None) -> pathlib.Path:
     if project_path is None:
         project_path = os.getcwd()
     
-    encoded_path = project_path.replace('/', '-')
+    encoded_path = project_path.replace('/', '-').replace('\\', '-').replace(':', '-')
     history_base = pathlib.Path.home() / '.claude' / 'projects'
     return history_base / encoded_path
 
